@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────
+# ts-health
+# ─────────────────────────────────────────────────────────────────────────
+
+# Captured output.
+# A real run prints your public IP, tailnet and LAN addresses, and device
+# hostnames. Sanitize before putting any of it in README.md — never commit
+# a raw capture.
+*.log
+*.out
+output/
+sample-output*
+ts-health-*.txt
+
+# Local scratch / experiments
+*.bak
+*.orig
+*.rej
+*.tmp
+*.local
+scratch/
+
+# Editor & OS cruft
+*~
+*.sw[a-p]
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Lint artifacts
+shellcheck.out
+*.shellcheck
+
+# Python bytecode — the script shells out to python3, and any helper
+# scripts added later would drop these here.
+__pycache__/
+*.py[cod]
+
+# Environment / secrets. Nothing here needs them today; cheap insurance.
+.env
+.env.*
