@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# ts-health — one-screen Tailscale health summary.
+#
+# No sudo required: `tailscale status` and friends are read-only.
+# Only mutating commands (up/set/down) need root.
+#
+# Exit codes:  0 = healthy   1 = degraded   2 = tailscale unavailable
+#
+# Usage: ts-health [--quick] [--help]
+#   --quick   skip network probes (peer ping + public IP lookup)
+
+set -uo pipefail
+
+QUICK=0
+for arg in "$@"; do
+  case "$arg" in
+    -q|--quick) QUICK=1 ;;
+    -h|--help)  awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+    *) echo "ts-health: unknown option '$arg' (try --help)" >&2; exit 2 ;;
+  esac
+done
+
+if [ -t 1 ]; then
+  BOLD=$'\033[1m'; RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; RST=$'\033[0m'
+else
+  BOLD=""; RED=""; GRN=""; YEL=""; DIM=""; RST=""
+fi
+
+command -v tailscale >/dev/null 2>&1 || { echo "${RED}tailscale not installed${RST}" >&2; exit 2; }
+
+DEGRADED=0
+row() { printf '  %-14s %s\n' "$1" "$2"; }
+
+# --- daemon state ---------------------------------------------------------
+SVC_EN=$(systemctl is-enabled tailscaled 2>/dev/null || echo unknown)
+SVC_AC=$(systemctl is-active  tailscaled 2>/dev/null || echo unknown)
+[ "$SVC_AC" = "active" ] || DEGRADED=1
+
+# --- parse status JSON ----------------------------------------------------
+JSON=$(timeout 10 tailscale status --json 2>/dev/null)
+if [ -z "$JSON" ]; then
+  echo "${RED}Could not read tailscale status (is tailscaled running?)${RST}" >&2
+  exit 2
+fi
+
+# Emit KEY<TAB>VALUE lines for the shell to consume.
+eval "$(printf '%s' "$JSON" | python3 -c '
+import json, sys, shlex
+
+d = json.load(sys.stdin)
+out = {}
+out["BACKEND"] = d.get("BackendState") or "unknown"
+
+health = d.get("Health") or []
+if isinstance(health, str):
+    health = [health]
+out["HEALTH_N"] = str(len(health))
+out["HEALTH"] = " | ".join(health)
+
+self_ = d.get("Self") or {}
+out["SELF"] = self_.get("HostName") or "?"
+ips = self_.get("TailscaleIPs") or []
+out["SELF_IP"] = ips[0] if ips else "?"
+
+exit_name = exit_ip = ""
+exit_online = "unknown"
+for p in (d.get("Peer") or {}).values():
+    if p.get("ExitNode"):
+        exit_name = p.get("HostName") or "?"
+        pips = p.get("TailscaleIPs") or []
+        exit_ip = pips[0] if pips else ""
+        exit_online = "yes" if p.get("Online") else "no"
+        break
+out["EXIT_NAME"] = exit_name
+out["EXIT_IP"] = exit_ip
+out["EXIT_ONLINE"] = exit_online
+
+peers = (d.get("Peer") or {}).values()
+out["PEERS_TOTAL"] = str(len(list(peers)))
+out["PEERS_ONLINE"] = str(sum(1 for p in (d.get("Peer") or {}).values() if p.get("Online")))
+
+for k, v in out.items():
+    print(f"{k}={shlex.quote(str(v))}")
+')"
+
+[ "$BACKEND" = "Running" ] || DEGRADED=1
+[ "$HEALTH_N" != "0" ] && DEGRADED=1
+
+# --- header ---------------------------------------------------------------
+echo
+echo "${BOLD}Tailscale — $SELF ($SELF_IP)${RST}"
+echo
+
+row "tailscaled" "$SVC_EN, $SVC_AC"
+row "BackendState" "$BACKEND"
+
+if [ "$HEALTH_N" = "0" ]; then
+  row "Health" "${GRN}OK — no warnings reported${RST}"
+else
+  row "Health" "${YEL}${HEALTH_N} warning(s): ${HEALTH}${RST}"
+fi
+
+row "Peers" "$PEERS_ONLINE/$PEERS_TOTAL online"
+
+# --- exit node ------------------------------------------------------------
+if [ -z "$EXIT_NAME" ]; then
+  row "Exit node" "${DIM}none in use${RST}"
+else
+  if [ "$EXIT_ONLINE" = "yes" ]; then
+    row "Exit node" "$EXIT_NAME ($EXIT_IP) — online, in use"
+  else
+    row "Exit node" "${RED}$EXIT_NAME — OFFLINE but still selected${RST}"
+    DEGRADED=1
+  fi
+fi
+
+# --- peer path (measured) -------------------------------------------------
+if [ "$QUICK" = "0" ] && [ -n "$EXIT_IP" ]; then
+  PING=$(timeout 12 tailscale ping --c=5 --timeout=2s "$EXIT_IP" 2>/dev/null | grep -F 'pong' | tail -1)
+  if [ -z "$PING" ]; then
+    row "Peer path" "${YEL}no pong within 12s${RST}"
+    DEGRADED=1
+  else
+    VIA=${PING#*via }; VIA=${VIA%% in *}
+    RTT=${PING##* in }
+    case "$VIA" in
+      DERP*) row "Peer path" "${YEL}relayed via $VIA, $RTT${RST}" ;;
+      *)     row "Peer path" "direct $VIA, $RTT" ;;
+    esac
+  fi
+fi
+
+# --- egress: the authoritative check is the kernel route ------------------
+ROUTE=$(ip route get 1.1.1.1 2>/dev/null | head -1)
+DEV=$(printf '%s' "$ROUTE" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+if [ -n "$DEV" ]; then
+  case "$DEV" in
+    tailscale*) row "Egress route" "${GRN}via $DEV${RST} ${DIM}(kernel: ip route get 1.1.1.1)${RST}" ;;
+    *)          row "Egress route" "via $DEV ${DIM}(NOT the tailnet)${RST}"
+                [ -n "$EXIT_NAME" ] && DEGRADED=1 ;;
+  esac
+fi
+
+if [ "$QUICK" = "0" ]; then
+  PUBIP=$(timeout 10 curl -s --max-time 8 https://api.ipify.org 2>/dev/null)
+  if [ -n "$PUBIP" ]; then
+    row "Public IP" "$PUBIP"
+    # Only meaningful if the exit node is on a different uplink than you.
+    echo "                 ${DIM}note: identical to your own WAN IP when the exit node${RST}"
+    echo "                 ${DIM}shares your uplink — the route line above is the proof${RST}"
+  else
+    row "Public IP" "${YEL}lookup failed (no internet?)${RST}"
+    DEGRADED=1
+  fi
+fi
+
+echo
+if [ "$DEGRADED" = "0" ]; then
+  echo "  ${GRN}${BOLD}healthy${RST}"
+  echo; exit 0
+else
+  echo "  ${YEL}${BOLD}degraded — see flagged lines above${RST}"
+  echo; exit 1
+fi
